@@ -195,6 +195,50 @@ DESCRIPTION_BIZ_KEYWORDS = (
     "基盤", "ソフトウェア", "ハードウェア", "ロボット", "IoT", "モビリティ", "物流DX",
 )
 
+BUSINESS_LABELS = (
+    "事業内容",
+    "業務内容",
+    "事業概要",
+    "事業案内",
+    "事業紹介",
+    "主な事業",
+    "主要事業",
+    "事業領域",
+    "事業分野",
+    "サービス内容",
+    "業種",
+    "業態",
+    "取扱品目",
+    "主要取扱品目",
+    "営業品目",
+)
+BUSINESS_LABEL_RE = re.compile("|".join(re.escape(k) for k in BUSINESS_LABELS))
+BUSINESS_LABEL_EXCLUDE_RE = re.compile(r"(事業所|事業部|事業課|事業計画)")
+BUSINESS_VALUE_PLACEHOLDERS = {
+    "-",
+    "ー",
+    "―",
+    "未定",
+    "準備中",
+    "未公開",
+    "非公開",
+    "不明",
+    "未記載",
+    "掲載なし",
+    "なし",
+    "無し",
+    "未登録",
+    "該当なし",
+    "n/a",
+    "na",
+    "none",
+    "null",
+}
+BUSINESS_VALUE_CUT_RE = re.compile(
+    r"(お問い合わせ|お問合せ|問合せ|採用情報|求人情報|TEL|電話|FAX|メール|E-mail|住所|所在地|https?://|@)",
+    re.IGNORECASE,
+)
+
 def looks_mojibake(text: str | None) -> bool:
     if not text:
         return False
@@ -892,9 +936,7 @@ def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None
             continue
         if low_role:
             continue
-        has_hiragana = bool(re.search(r"[\u3041-\u3096]", cleaned))
-        has_kanji = bool(re.search(r"[\u4E00-\u9FFF]", cleaned))
-        if has_hiragana and has_kanji:
+        if not tag_set and not any(k in cleaned for k in role_keywords):
             continue
         if not (NAME_CHUNK_RE.search(cleaned) or KANA_NAME_RE.search(cleaned)):
             continue
@@ -1055,6 +1097,99 @@ def _truncate_description(text: str) -> str:
     truncated = re.sub(r"[、。．,;]+$", "", truncated)
     trimmed = re.sub(r"\s+\S*$", "", truncated).strip()
     return trimmed if len(trimmed) >= DESCRIPTION_MIN_LEN else truncated.rstrip()
+
+
+def _normalize_business_label(label: str) -> str:
+    cleaned = unicodedata.normalize("NFKC", label or "")
+    cleaned = re.sub(r"\s+", "", cleaned)
+    return cleaned.strip("・:：")
+
+
+def _is_business_label(label: str) -> bool:
+    cleaned = _normalize_business_label(label)
+    if not cleaned:
+        return False
+    if BUSINESS_LABEL_EXCLUDE_RE.search(cleaned):
+        return False
+    return bool(BUSINESS_LABEL_RE.search(cleaned))
+
+
+def _clean_business_value(value: str) -> str:
+    text = html_mod.unescape(value or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.strip("・-—‐－:：/|")
+    if not text:
+        return ""
+    m = BUSINESS_VALUE_CUT_RE.search(text)
+    if m:
+        text = text[: m.start()].strip()
+    if not text:
+        return ""
+    text = re.sub(r"(?:他|ほか|外|等)\s*\d*(?:名|人)?\s*$", "", text).strip()
+    if not text:
+        return ""
+    lower = text.lower()
+    if text in BUSINESS_VALUE_PLACEHOLDERS or lower in BUSINESS_VALUE_PLACEHOLDERS:
+        return ""
+    return text
+
+
+def _build_description_from_business_value(value: str) -> str:
+    cleaned = _clean_business_value(value)
+    if not cleaned:
+        return ""
+    direct = clean_description_value(cleaned)
+    if direct:
+        return direct
+    if len(cleaned) < 3:
+        return ""
+    sentence = f"{cleaned}を主な事業としています"
+    return clean_description_value(sentence) or ""
+
+
+def extract_business_description(text: str | None, html: str | None) -> str:
+    candidates: list[str] = []
+    if html:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            soup = None
+        if soup:
+            for tr in soup.find_all("tr"):
+                cells = tr.find_all(["th", "td"])
+                if len(cells) < 2:
+                    continue
+                label = cells[0].get_text(separator=" ", strip=True)
+                value = cells[1].get_text(separator=" ", strip=True)
+                if label and value and _is_business_label(label):
+                    candidates.append(value)
+            for dl in soup.find_all("dl"):
+                dts = dl.find_all("dt")
+                dds = dl.find_all("dd")
+                for dt, dd in zip(dts, dds):
+                    label = dt.get_text(separator=" ", strip=True)
+                    value = dd.get_text(separator=" ", strip=True)
+                    if label and value and _is_business_label(label):
+                        candidates.append(value)
+
+    if text:
+        lines = [ln.strip() for ln in re.split(r"[\r\n]+", text) if ln.strip()]
+        for line in lines:
+            if ":" in line or "：" in line:
+                label, value = re.split(r"[:：]", line, 1)
+                if _is_business_label(label):
+                    candidates.append(value)
+        for idx in range(len(lines) - 1):
+            if _is_business_label(lines[idx]):
+                candidates.append(lines[idx + 1])
+
+    for value in candidates:
+        desc = _build_description_from_business_value(value)
+        if desc:
+            return desc
+    return ""
 
 
 def clean_description_value(val: str) -> str:
@@ -1236,6 +1371,9 @@ def extract_lead_description(html: str | None) -> str | None:
 def extract_description_from_payload(payload: dict[str, Any]) -> str:
     text = payload.get("text", "") or ""
     html = payload.get("html", "") or ""
+    biz_desc = extract_business_description(text, html)
+    if biz_desc:
+        return biz_desc
     snippet = extract_description_snippet(text)
     if snippet:
         return snippet

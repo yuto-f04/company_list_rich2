@@ -256,6 +256,15 @@ def test_extract_candidates_rep_picks_ceo_when_multiple(scraper):
     cands = scraper.extract_candidates(text, html=html)
     assert any(_strip_rep_tags(name).replace(" ", "").endswith("関裕之") for name in cands["rep_names"])
 
+def test_extract_candidates_rep_rejects_long_paragraph(scraper):
+    text = "代表取締役\n当社グループは、昭和32年4月に石炭配送を主体として創業しました。"
+    html = """
+    <div>代表取締役</div>
+    <div>当社グループは、昭和32年4月に石炭配送を主体として創業しました。</div>
+    """
+    cands = scraper.extract_candidates(text, html=html)
+    assert not any("グループ" in _strip_rep_tags(name) for name in cands["rep_names"])
+
 
 def test_extract_candidates_finance_inline_variations(scraper):
     text = "事業概要 売上高 12億円 営業利益 ▲3百万円 年商 15億"

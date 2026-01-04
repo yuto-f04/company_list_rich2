@@ -98,6 +98,7 @@ REP_NAME_EXACT_BLOCKLIST = {
         "スタッフ紹介", "スタッフ",
         "メニュー", "Menu", "menu",
         "トップページ", "Home", "home", "ホーム",
+        "文字", "文字サイズ",
         "沿革", "法人紹介", "会社紹介",
         "交代", "任を仰せつかりました",
         "所属",
@@ -117,7 +118,7 @@ REP_NAME_SUBSTR_BLOCKLIST = (
     "センター", "法人", "こと", "公印", "いただき", "役", "組織"
 )
 REP_NAME_EXACT_BLOCKLIST_LOWER = {s.lower() for s in REP_NAME_EXACT_BLOCKLIST}
-NAME_CHUNK_RE = re.compile(r"[\u4E00-\u9FFF]{1,3}(?:[??\s]{0,1}[\u4E00-\u9FFF]{1,3})+")
+NAME_CHUNK_RE = re.compile(r"[\u4E00-\u9FFF]{1,3}(?:[\u30fb\uff65\s\u3000]{0,1}[\u4E00-\u9FFF]{1,3})+")
 KANA_NAME_RE = re.compile(r"[\u3041-\u3096\u30A1-\u30FA\u30FC]{2,}(?:[\u3041-\u3096\u30A1-\u30FA\u30FC\s][\u3041-\u3096\u30A1-\u30FA\u30FC]{2,})+")
 REP_BUSINESS_TERMS = (
     "事業",
@@ -1020,7 +1021,13 @@ class CompanyScraper:
             return False
         if re.search(r"[0-9@]", name):
             return False
-        return bool(NAME_CHUNK_RE.search(name) or KANA_NAME_RE.search(name))
+        has_kanji = bool(NAME_CHUNK_RE.search(name))
+        has_kana = bool(KANA_NAME_RE.search(name))
+        if has_kana and not has_kanji:
+            # Kana-only names should have a separator to avoid generic nouns (e.g., グループ).
+            if " " not in name and "・" not in name and "･" not in name:
+                return False
+        return bool(has_kanji or has_kana)
 
     @staticmethod
     def _looks_like_full_address(text: str) -> bool:
@@ -1056,9 +1063,44 @@ class CompanyScraper:
         news_words = ("退任", "就任", "人事", "異動", "お知らせ", "ニュース", "プレスリリース")
         if any(w in text for w in news_words):
             return None
+        text = unicodedata.normalize("NFKC", text)
+        text_norm = text.strip()
+        if not text_norm:
+            return None
+        if re.fullmatch(r"[-ー―‐—–]+", text_norm):
+            return None
+        placeholders = {
+            "未定",
+            "準備中",
+            "未公開",
+            "非公開",
+            "不明",
+            "未記載",
+            "掲載なし",
+            "なし",
+            "無し",
+            "未登録",
+            "該当なし",
+            "n/a",
+            "na",
+            "none",
+            "null",
+        }
+        text_lower = text_norm.lower()
+        if text_norm in placeholders or text_lower in placeholders:
+            return None
+        text = text_norm
+        # strip label-like prefixes when merged into the value
+        text = re.sub(r"^(?:代表者名?|代表取締役|代表者|代表|社長|会長|理事長|院長|学長|園長|校長|CEO)\s*[:：]\s*", "", text)
+        text = re.sub(r"^(?:氏名|お名前|名前)\s*[:：]\s*", "", text)
+        text = re.sub(r"^(?:代表者名?|代表取締役|代表者|代表|社長|会長|理事長|院長|学長|園長|校長|CEO)\s+", "", text)
+        text = re.sub(r"^(?:氏名|お名前|名前)\s+", "", text)
+        # remove trailing "others" markers
+        text = re.sub(r"(?:他|ほか|外|等)\s*\d*(?:名|人)?\s*$", "", text)
         # remove parentheses content
         text = re.sub(r"[（(][^）)]*[）)]", "", text)
         # keep only segment before punctuation/newline
+        text = re.split(r"(?i)(?:TEL|電話|FAX|メール|E-mail|住所|所在地|本社)", text, maxsplit=1)[0]
         text = re.split(r"[、。\n/|｜,;；]", text)[0]
         text = text.strip(" 　:：-‐―－ー'\"/／")
         titles = (
@@ -1110,7 +1152,7 @@ class CompanyScraper:
             text = text.strip(" 　")
             if text == before:
                 break
-        if text.endswith(("氏", "様")):
+        if text.endswith(("氏", "様", "さま", "殿", "先生")):
             text = text[:-1]
         text = re.sub(r"(と申します|といたします|になります|させていただきます|いたします|いたしました)$", "", text)
         text = re.sub(r"^(の|当社|当園|当組合|当法人|弊社|弊園|弊組合|私|わたくし)", "", text)
@@ -4157,7 +4199,11 @@ class CompanyScraper:
                 return False
             if field == "rep_names":
                 cand = self.clean_rep_name(cleaned)
-                return bool(cand and self._looks_like_person_name(cand))
+                if not cand:
+                    return False
+                if len(cleaned) > 40 or re.search(r"[。．!?]", cleaned) or "、" in cleaned:
+                    return False
+                return bool(self._looks_like_person_name(cand))
             if field == "phone_numbers":
                 return bool(PHONE_RE.search(cleaned))
             if field == "addresses":
@@ -4462,25 +4508,37 @@ class CompanyScraper:
         if not sequential_texts:
             sequential_texts = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
 
+
+        role_terms = (
+            "(?:\u4ee3\u8868\\s*\u53d6\u7de0\u5f79(?:\u793e\u9577|\u4f1a\u9577|\u526f\u4f1a\u9577|\u526f\u793e\u9577)?"
+            "|\u4ee3\u8868\\s*\u57f7\u884c\u5f79\u793e\u9577"
+            "|\u4ee3\u8868\\s*\u57f7\u884c\u5f79"
+            "|\u4ee3\u8868\\s*\u7406\u4e8b\u9577"
+            "|\u4ee3\u8868\\s*\u7406\u4e8b"
+            "|\u4ee3\u8868\\s*\u793e\u54e1"
+            "|\u4ee3\u8868\u8005|\u4ee3\u8868|\u793e\u9577|\u4f1a\u9577|CEO)"
+        )
+        role_name_re = re.compile(
+            f"({role_terms})"
+            "(?:\\s*(?:\u57f7\u884c\u5f79(?:\u54e1)?|\u793e\u9577\u57f7\u884c\u5f79(?:\u54e1)?))?"
+            "[\\s\u3000:\uff1a\u30fb]{0,4}"
+            "([\u4e00-\u9fa5]{1,3}(?:[\u30fb\uff65\\s\u3000]{0,1}[\u4e00-\u9fa5]{1,3})+?)"
+            f"(?=(?:[\\s\u3000:\uff1a\u30fb]*{role_terms}|$))"
+        )
         if self.rep_strict_sources and sequential_texts:
-            role_kw = re.compile(
-                r"(代表取締役社長|代表執行役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表社員|代表者|代表|社長|会長|CEO)",
-                flags=re.I,
-            )
             added_roles = 0
             for line in sequential_texts:
-                if not role_kw.search(line):
-                    continue
-                stripped = role_kw.sub(" ", line)
-                name_match = NAME_CHUNK_RE.search(stripped) or KANA_NAME_RE.search(stripped)
-                if not name_match:
-                    continue
-                cleaned = self.clean_rep_name(name_match.group(0))
-                if cleaned and self._looks_like_person_name(cleaned):
-                    reps.append(f"[ROLE]{cleaned}")
-                    added_roles += 1
-                    if added_roles >= 2:
-                        break
+                for m in role_name_re.finditer(line):
+                    role = re.sub(r"\s+", "", m.group(1))
+                    name = m.group(2)
+                    cleaned = self.clean_rep_name(name) or self.clean_rep_name(f"{role} {name}")
+                    if cleaned and self._looks_like_person_name(cleaned):
+                        reps.append(f"[ROLE]{cleaned}")
+                        added_roles += 1
+                        if added_roles >= 2:
+                            break
+                if added_roles >= 2:
+                    break
 
         def _looks_like_label(text: str) -> tuple[bool, str]:
             if not text:
@@ -4511,6 +4569,40 @@ class CompanyScraper:
             if not value_candidate or len(value_candidate) > 120:
                 continue
             pair_values.append((normalized_label, value_candidate, False))
+
+        # 長い1行に複数ラベルが並ぶケースを分割して抽出
+        for text in sequential_texts:
+            cleaned_line = text.replace("\u200b", "").strip()
+            if not cleaned_line or len(cleaned_line) < 120:
+                continue
+            tokens = [t for t in cleaned_line.split(" ") if t]
+            if len(tokens) < 6:
+                continue
+            label_positions: list[tuple[int, str]] = []
+            for idx, token in enumerate(tokens):
+                is_label, normalized_label = _looks_like_label(token)
+                if is_label:
+                    label_positions.append((idx, normalized_label))
+            if len(label_positions) < 2:
+                continue
+            label_positions.append((len(tokens), ""))
+            for pos_idx in range(len(label_positions) - 1):
+                label_idx, normalized_label = label_positions[pos_idx]
+                next_idx, _ = label_positions[pos_idx + 1]
+                if not normalized_label:
+                    continue
+                field = _field_for_label(normalized_label)
+                if not field:
+                    continue
+                value_text = " ".join(tokens[label_idx + 1:next_idx]).strip()
+                if not value_text:
+                    continue
+                max_len = 160 if field == "addresses" else 120
+                if len(value_text) > max_len:
+                    continue
+                if not _is_value_for_field(field, value_text):
+                    continue
+                pair_values.append((normalized_label, value_text, False))
 
         for idx in range(len(sequential_texts) - 1):
             is_label, normalized = _looks_like_label(sequential_texts[idx])
@@ -4601,34 +4693,46 @@ class CompanyScraper:
                         def _pick_best_rep_name(val: str) -> tuple[str | None, bool]:
                             if not val:
                                 return None, False
+                            if len(val) > 60 or re.search(r"[。．!?]", val) or "、" in val:
+                                return None, False
                             # 複数列挙（例: 代表取締役会長A、代表取締役社長B）から強い役職を優先して拾う
                             role_priority = {
-                                "代表取締役社長": 100,
+                                "\u4ee3\u8868\u53d6\u7de0\u5f79\u793e\u9577": 100,
+                                "\u4ee3\u8868\u53d6\u7de0\u5f79\u4f1a\u9577": 96,
+                                "\u4ee3\u8868\u53d6\u7de0\u5f79\u526f\u4f1a\u9577": 92,
+                                "\u4ee3\u8868\u53d6\u7de0\u5f79\u526f\u793e\u9577": 88,
                                 "CEO": 95,
-                                "代表執行役社長": 90,
-                                "代表取締役": 85,
-                                "代表理事長": 80,
-                                "代表理事": 75,
-                                "社長": 70,
-                                "代表取締役会長": 60,
-                                "会長": 55,
-                                "代表社員": 50,
-                                "代表者": 45,
-                                "代表": 40,
+                                "\u4ee3\u8868\u57f7\u884c\u5f79\u793e\u9577": 90,
+                                "\u4ee3\u8868\u53d6\u7de0\u5f79": 85,
+                                "\u4ee3\u8868\u7406\u4e8b\u9577": 80,
+                                "\u4ee3\u8868\u7406\u4e8b": 75,
+                                "\u793e\u9577": 70,
+                                "\u4f1a\u9577": 55,
+                                "\u4ee3\u8868\u793e\u54e1": 50,
+                                "\u4ee3\u8868\u8005": 45,
+                                "\u4ee3\u8868": 40,
                             }
-                            role_name_re = re.compile(
-                                r"(代表取締役社長|代表執行役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表社員|代表者|代表|社長|会長|CEO)"
-                                r"[\s\u3000:：・]{0,4}"
-                                r"([一-龥]{1,3}(?:[・･ \u3000]{0,1}[一-龥]{1,3})+)"
-                            )
                             best: tuple[int, str] | None = None
                             for m in role_name_re.finditer(val):
-                                role = m.group(1)
+                                role = re.sub(r"\s+", "", m.group(1))
                                 name = m.group(2)
                                 cleaned_name = self.clean_rep_name(name) or self.clean_rep_name(f"{role} {name}")
                                 if not cleaned_name or not self._looks_like_person_name(cleaned_name):
                                     continue
                                 prio = int(role_priority.get(role, 0))
+                                if prio == 0 and "代表取締役" in role:
+                                    if "副会長" in role:
+                                        prio = 92
+                                    elif "副社長" in role:
+                                        prio = 88
+                                    elif "社長" in role:
+                                        prio = 100
+                                    elif "会長" in role:
+                                        prio = 96
+                                    else:
+                                        prio = 85
+                                elif prio == 0 and role == "代表":
+                                    prio = 40
                                 cand = (prio, cleaned_name)
                                 if best is None or cand[0] > best[0]:
                                     best = cand
